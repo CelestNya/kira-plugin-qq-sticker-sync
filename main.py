@@ -15,12 +15,15 @@ Usage:
 """
 
 import asyncio
+import base64
+import io
 import os
 import re
 import time
 from typing import Optional
 
 import httpx
+from PIL import Image as PILImage
 
 from core.chat.message_elements import Image
 from core.logging_manager import get_logger
@@ -54,6 +57,8 @@ class QQStickerSyncPlugin(BasePlugin):
         self.auto_delete = self.plugin_cfg.get("auto_delete", False)
         self.download_concurrency = max(self.plugin_cfg.get("download_concurrency", 5), 1)
         self.vlm_concurrency = max(self.plugin_cfg.get("vlm_concurrency", 3), 1)
+        self.vlm_compress_enabled = self.plugin_cfg.get("vlm_compress_enabled", False)
+        self.vlm_compress_quality = max(min(self.plugin_cfg.get("vlm_compress_quality", 85), 100), 10)
         self.sticker_mgr = self.ctx.sticker_manager
 
         self._download_sem = asyncio.Semaphore(self.download_concurrency)
@@ -68,7 +73,8 @@ class QQStickerSyncPlugin(BasePlugin):
         )
 
         self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, download_concurrency={self.download_concurrency}, vlm_concurrency={self.vlm_concurrency})")
+        compress = f"quality={self.vlm_compress_quality}" if self.vlm_compress_enabled else "off"
+        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, download_concurrency={self.download_concurrency}, vlm_concurrency={self.vlm_concurrency}, vlm_compress={compress})")
 
     async def terminate(self):
         if self._sync_task:
@@ -433,9 +439,27 @@ class QQStickerSyncPlugin(BasePlugin):
             if not os.path.exists(sticker_path):
                 logger.warning(f"Sticker file not found for VLM: {sticker_path}")
                 return None
+
+            if self.vlm_compress_enabled:
+                pil_img = PILImage.open(sticker_path)
+                # RGBA → RGB (JPEG 不支持 alpha 通道)
+                if pil_img.mode == "RGBA":
+                    bg = PILImage.new("RGB", pil_img.size, (255, 255, 255))
+                    bg.paste(pil_img, mask=pil_img.split()[3])
+                    pil_img = bg
+                elif pil_img.mode != "RGB":
+                    pil_img = pil_img.convert("RGB")
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=self.vlm_compress_quality)
+                bs64 = base64.b64encode(buf.getvalue()).decode()
+                image = Image(image=f"data:image/jpeg;base64,{bs64}")
+                logger.info(f"Compressed sticker {filename} → JPEG q={self.vlm_compress_quality} ({buf.tell()/1024:.0f}KB base64)")
+            else:
+                image = Image(image=sticker_path)
+
             sticker_desc = await desc_img(
                 client=vlm,
-                image=Image(image=sticker_path),
+                image=image,
                 prompt=STICKER_DESC_PROMPT,
             )
             return sticker_desc

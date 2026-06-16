@@ -14,6 +14,16 @@
         "default": 3,
         "hint": "VLM 描述并发数（控制同时调用 VLM 的上限，最小 1）"
     },
+    "vlm_compress_enabled": {
+        "type": "switch",
+        "default": false,
+        "hint": "VLM 描述前将图片转为 JPEG 有损压缩，减小 payload"
+    },
+    "vlm_compress_quality": {
+        "type": "integer",
+        "default": 85,
+        "hint": "JPEG 压缩质量 (10-100)"
+    },
     "auto_delete": {
         "type": "switch",
         "default": false,
