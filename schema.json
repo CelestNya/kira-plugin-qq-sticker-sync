@@ -1,0 +1,12 @@
+{
+    "sync_interval_sec": {
+        "type": "integer",
+        "default": 1800,
+        "hint": "同步间隔（秒，最小 60 秒）"
+    },
+    "auto_delete": {
+        "type": "switch",
+        "default": false,
+        "hint": "自动删除 QQ 收藏中已取消的表情"
+    }
+}
