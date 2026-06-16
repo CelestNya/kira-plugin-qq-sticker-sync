@@ -9,10 +9,10 @@
         "default": 5,
         "hint": "下载并发数（最小 1）"
     },
-    "register_concurrency": {
+    "vlm_concurrency": {
         "type": "integer",
         "default": 3,
-        "hint": "注册并发数（控制触发 VLM 描述的并发上限，最小 1）"
+        "hint": "VLM 描述并发数（控制同时调用 VLM 的上限，最小 1）"
     },
     "auto_delete": {
         "type": "switch",

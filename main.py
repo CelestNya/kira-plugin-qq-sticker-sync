@@ -22,8 +22,10 @@ from typing import Optional
 
 import httpx
 
+from core.chat.message_elements import Image
 from core.logging_manager import get_logger
 from core.plugin import BasePlugin, logger, register
+from core.utils.common_utils import desc_img
 from core.utils.path_utils import get_data_path
 from core.adapter.adapter_utils import IMAdapter
 
@@ -31,6 +33,10 @@ logger = get_logger("qq-sticker-sync", "cyan")
 
 STICKER_DIR = f"{get_data_path()}/sticker"
 QQ_SYNC_PREFIX = "qqsync_"
+STICKER_DESC_PROMPT = (
+    "这是一张sticker（表情包），请描述这张表情包的内容和聊天中哪些情景使用此表情包，"
+    "要求描述精确，不要太长，不要使用Markdown等标记符号，如果有文字请将其输出"
+)
 
 
 class QQStickerSyncPlugin(BasePlugin):
@@ -47,11 +53,11 @@ class QQStickerSyncPlugin(BasePlugin):
         self.interval_sec = max(self.plugin_cfg.get("sync_interval_sec", 1800), 60)
         self.auto_delete = self.plugin_cfg.get("auto_delete", False)
         self.download_concurrency = max(self.plugin_cfg.get("download_concurrency", 5), 1)
-        self.register_concurrency = max(self.plugin_cfg.get("register_concurrency", 3), 1)
+        self.vlm_concurrency = max(self.plugin_cfg.get("vlm_concurrency", 3), 1)
         self.sticker_mgr = self.ctx.sticker_manager
 
         self._download_sem = asyncio.Semaphore(self.download_concurrency)
-        self._register_sem = asyncio.Semaphore(self.register_concurrency)
+        self._vlm_sem = asyncio.Semaphore(self.vlm_concurrency)
 
         os.makedirs(STICKER_DIR, exist_ok=True)
 
@@ -62,7 +68,7 @@ class QQStickerSyncPlugin(BasePlugin):
         )
 
         self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, download_concurrency={self.download_concurrency}, register_concurrency={self.register_concurrency})")
+        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, download_concurrency={self.download_concurrency}, vlm_concurrency={self.vlm_concurrency})")
 
     async def terminate(self):
         if self._sync_task:
@@ -247,32 +253,37 @@ class QQStickerSyncPlugin(BasePlugin):
         tasks = [_download_one(i, u, h, m) for i, (u, h, m) in enumerate(pending)]
         await asyncio.gather(*tasks)
 
-        # ── Phase 2: 限流注册（Semaphore 控制 VLM 并发） ──
+        # ── Phase 2: 注册（placeholder desc，不触发 default-sticker VLM） ──
+        registered = []  # (item, sid)
+
+        async def _register_one(item: dict):
+            sid = await self._register_content(item)
+            if sid is not None:
+                registered.append((item, sid))
+
+        reg_tasks = [_register_one(d) for d in download_results if d is not None]
+        if reg_tasks:
+            await asyncio.gather(*reg_tasks)
+
+        # ── Phase 3: 限流 VLM 描述（Semaphore 控制并发） ──
         new_count = 0
 
-        async def _register_one(item: dict) -> bool:
-            async with self._register_sem:
-                return await self._register_content(item)
+        if registered:
+            logger.info(f"Phase 1+2 complete, describing {len(registered)} stickers (vlm_concurrency={self.vlm_concurrency})...")
 
-        reg_tasks = []
-        for item in download_results:
-            if item is None:
-                continue
-            reg_tasks.append(_register_one(item))
+            async def _describe_one(item: dict, sid: str):
+                async with self._vlm_sem:
+                    desc = await self._describe_sticker(item)
+                    if desc:
+                        try:
+                            await self.sticker_mgr.update_sticker_desc(sid, desc)
+                            logger.info(f"Described sticker {sid}: {desc[:60]}...")
+                        except Exception as e:
+                            logger.error(f"Failed to update desc for sticker {sid}: {e}")
 
-        if reg_tasks:
-            reg_results = await asyncio.gather(*reg_tasks)
-            for item, success in zip([d for d in download_results if d], reg_results):
-                if not success:
-                    continue
-                new_count += 1
-                url_hash = item["url_hash"]
-                meta = item["meta"]
-                e_id = meta.get("e_id", "")
-                if meta.get("is_mark_face") and e_id:
-                    existing_eids.add(e_id)
-                else:
-                    existing_hashes.add(url_hash)
+            vlm_tasks = [_describe_one(item, sid) for item, sid in registered]
+            await asyncio.gather(*vlm_tasks)
+            new_count = len(registered)
 
         # Collect hashes and e_ids from THIS sync for auto-delete
         current_hashes = set()
@@ -368,10 +379,10 @@ class QQStickerSyncPlugin(BasePlugin):
             logger.error(f"Error downloading {download_url[:60]}...: {e}")
         return None
 
-    # ── 注册（Semaphore 限流，触发 default-sticker VLM） ────────
+    # ── 注册（placeholder desc，跳过 default-sticker VLM） ──────
 
-    async def _register_content(self, item: dict) -> bool:
-        """Register downloaded content with StickerManager. Gated by _register_sem."""
+    async def _register_content(self, item: dict) -> Optional[str]:
+        """Register downloaded content, return sticker_id. No VLM trigger."""
         filename = item["filename"]
         content = item["content"]
         url_hash = item["url_hash"]
@@ -385,7 +396,7 @@ class QQStickerSyncPlugin(BasePlugin):
                 file_bytes=content,
                 original_filename=filename,
                 sticker_id=None,
-                desc="",
+                desc="__pending_vlm__",  # non-empty → default-sticker skips VLM
             )
 
             extra_fields = {
@@ -405,11 +416,32 @@ class QQStickerSyncPlugin(BasePlugin):
                 logger.info(f"Registered QQ marketplace sticker: id={result['id']}, file={filename}")
             else:
                 logger.info(f"Registered QQ sticker: id={result['id']}, file={filename}")
-            return True
+            return result["id"]
 
         except Exception as e:
             logger.error(f"Failed to register sticker {filename}: {e}")
-            return False
+            return None
+
+    # ── VLM 描述（受 _vlm_sem 限流） ─────────────────────────────
+
+    async def _describe_sticker(self, item: dict) -> Optional[str]:
+        """VLM-describe a sticker. Returns description string or None on failure."""
+        filename = item["filename"]
+        try:
+            vlm = self.ctx.provider_mgr.get_default_vlm()
+            sticker_path = os.path.join(STICKER_DIR, filename)
+            if not os.path.exists(sticker_path):
+                logger.warning(f"Sticker file not found for VLM: {sticker_path}")
+                return None
+            sticker_desc = await desc_img(
+                client=vlm,
+                image=Image(image=sticker_path),
+                prompt=STICKER_DESC_PROMPT,
+            )
+            return sticker_desc
+        except Exception as e:
+            logger.error(f"VLM description failed for sticker {filename}: {e}")
+            return None
 
     # ── 删除失效表情 ──────────────────────────────────────────
 

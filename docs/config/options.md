@@ -22,19 +22,19 @@ QQ 收藏表情不常变动，建议保持默认值 1800（30 分钟）以减少
 
 下载阶段是纯网络 I/O，CDN 抗并发能力强。默认 5 在大多数网络环境下能充分利用带宽。
 
-## register_concurrency
+## vlm_concurrency
 
 - **类型**: `integer`
 - **默认**: `3`
 - **范围**: 1 及以上
 
-注册并发数。控制同时触发 VLM 描述的最大并发量。
+VLM 描述并发数。控制同时调用 VLM 生成贴纸描述的最大并发量。
 
-下载完成后，插件通过 StickerManager 注册贴纸，注册过程会触发 `default-sticker` 的 VLM 描述回调。此参数限制同一时间触发的 VLM 调用数，防止因批量同步瞬间打穿 API 限流。
+下载注册完成后，插件自带 VLM 描述阶段。`StickerManager.register_sticker` 用 `asyncio.create_task` 触发回调，因此 `default-sticker` 的 VLM 回调不受外部控制。本插件绕过该机制，用 placeholder desc 跳过默认回调，自行管理 VLM 调用并受 Semaphore 约束。
 
-- **3（默认）**：适合大多数场景，同时描述 3 张
-- **1**：完全串行描述，最友好但最慢
-- **5**：网络好、API 额度高时可调大
+- **3（默认）**：同时描述 3 张，平滑友好
+- **1**：完全串行，最慢但无限流风险
+- **5**：对高额度 VLM API 可适当调高
 
 ## auto_delete
 
