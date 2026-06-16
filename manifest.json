@@ -1,7 +1,7 @@
 {
     "display_name": "QQ 表情同步",
     "plugin_id": "qq-sticker-sync",
-    "uninstallable": true,
+    "uninstallable": false,
     "version": "1.1.0",
     "author": "KiraAI",
     "description": "通过 NapCat API 自动同步 QQ 收藏的表情包到本地贴纸库",
