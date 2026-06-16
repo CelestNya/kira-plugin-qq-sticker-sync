@@ -27,6 +27,6 @@
     "auto_delete": {
         "type": "switch",
         "default": false,
-        "hint": "自动删除 QQ 收藏中已取消的表情"
+        "hint": "自动删除 QQ 收藏中已取消的表情（⚠ 会删除所有不在 QQ 收藏列表中的 qqsync_ 前缀贴纸）"
     }
 }
