@@ -19,5 +19,10 @@ Thumbs.db
 .venv/
 venv/
 
+# VitePress
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/.vitepress/.temp/
+
 # Claude
 .claude/
