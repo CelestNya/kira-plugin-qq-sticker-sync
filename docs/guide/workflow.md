@@ -19,6 +19,9 @@ KiraAI 启动
   │                                              │
   ▼ 每 sync_interval_sec 秒                      │
   │                                              │
+  ├─ 0. _recover_pending_vlm()                  │
+  │    扫描 __pending_vlm__ 贴纸 → VLM 补描述   │
+  │                                              │
   ├─ 1. _cleanup_stale_db()                     │
   │    清理文件已删除的 DB 条目                   │
   │                                              │

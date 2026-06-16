@@ -20,13 +20,18 @@ QQStickerSyncPlugin (BasePlugin)
 │   └─ _wait_for_client()     → 轮询等待 NapCat 登录就绪
 │
 ├─ 同步逻辑
-│   ├─ _sync_loop()           → 后台无限循环
-│   ├─ _do_sync()             → 单次同步入口
-│   └─ _sync_once(client)     → 核心同步实现
+│   ├─ _sync_loop()             → 后台无限循环
+│   ├─ _do_sync()               → 单次同步入口
+│   └─ _sync_once(client)       → 核心同步实现
 │
-├─ 下载与注册（两阶段）
-│   ├─ _download_content()   → 并发下载，asyncio.gather 无限制
-│   └─ _register_content()   → 限流注册，Semaphore 控制 VLM 触发并发
+├─ VLM 恢复
+│   ├─ _recover_pending_vlm()   → 扫描 __pending_vlm__ 贴纸，补 VLM 描述
+│   └─ _vlm_describe_file()     → 共享 VLM 核心（带压缩）
+│
+├─ 下载与注册
+│   ├─ _download_content()     → 并发下载，asyncio.gather 无限制
+│   ├─ _register_content()     → 注册（placeholder desc 跳过 VLM 回调）
+│   └─ _describe_sticker()     → 新 sticker VLM 描述，委托 _vlm_describe_file
 │
 ├─ 清理
 │   ├─ _cleanup_stale_db()      → 删除文件不存在的 DB 条目

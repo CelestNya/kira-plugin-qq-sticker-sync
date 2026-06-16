@@ -176,6 +176,9 @@ class QQStickerSyncPlugin(BasePlugin):
     async def _sync_once(self, client):
         """Fetch custom face list from NapCat and sync new stickers"""
 
+        # ── Recovery: 修复之前同步失败的 pending VLM 贴纸 ──
+        await self._recover_pending_vlm()
+
         # Clean stale DB entries where file was deleted from disk
         await self._cleanup_stale_db()
 
@@ -428,21 +431,57 @@ class QQStickerSyncPlugin(BasePlugin):
             logger.error(f"Failed to register sticker {filename}: {e}")
             return None
 
-    # ── VLM 描述（受 _vlm_sem 限流） ─────────────────────────────
+    # ── VLM 描述恢复 ────────────────────────────────────────────
 
-    async def _describe_sticker(self, item: dict) -> Optional[str]:
-        """VLM-describe a sticker. Returns description string or None on failure."""
-        filename = item["filename"]
+    async def _recover_pending_vlm(self):
+        """Scan all qqsync_ stickers, find __pending_vlm__ ones and describe them."""
+        pending = []
+        for sid, info in self.sticker_mgr.sticker_dict.items():
+            path = info.get("path", "")
+            desc = info.get("desc", "")
+            if path.startswith(QQ_SYNC_PREFIX) and desc == "__pending_vlm__":
+                pending.append((sid, path))
+
+        if not pending:
+            return
+
+        logger.info(f"Recovery: found {len(pending)} stickers with pending VLM description")
+
+        async def _recover_one(sid: str, path: str):
+            async with self._vlm_sem:
+                full_path = os.path.join(STICKER_DIR, path)
+                if not os.path.exists(full_path):
+                    logger.warning(f"Recovery: sticker file missing, deleting {sid} ({path})")
+                    try:
+                        await self.sticker_mgr.delete_sticker(sid, delete_file=False)
+                    except Exception:
+                        pass
+                    return
+                desc = await self._vlm_describe_file(full_path, path)
+                if desc:
+                    try:
+                        await self.sticker_mgr.update_sticker_desc(sid, desc)
+                        logger.info(f"Recovery: described sticker {sid}: {desc[:60]}...")
+                    except Exception as e:
+                        logger.error(f"Recovery: failed to update desc for sticker {sid}: {e}")
+
+        tasks = [_recover_one(sid, path) for sid, path in pending]
+        await asyncio.gather(*tasks)
+        logger.info("Recovery: pending VLM description complete")
+
+    # ── VLM 描述（共享核心，带压缩） ────────────────────────────
+
+    async def _vlm_describe_file(self, filepath: str, label: str) -> Optional[str]:
+        """VLM-describe an image file. Shared by recovery and new sticker phases."""
+        if not os.path.exists(filepath):
+            logger.warning(f"Sticker file not found for VLM: {filepath}")
+            return None
+
         try:
             vlm = self.ctx.provider_mgr.get_default_vlm()
-            sticker_path = os.path.join(STICKER_DIR, filename)
-            if not os.path.exists(sticker_path):
-                logger.warning(f"Sticker file not found for VLM: {sticker_path}")
-                return None
 
             if self.vlm_compress_enabled:
-                pil_img = PILImage.open(sticker_path)
-                # RGBA → RGB (JPEG 不支持 alpha 通道)
+                pil_img = PILImage.open(filepath)
                 if pil_img.mode == "RGBA":
                     bg = PILImage.new("RGB", pil_img.size, (255, 255, 255))
                     bg.paste(pil_img, mask=pil_img.split()[3])
@@ -453,9 +492,9 @@ class QQStickerSyncPlugin(BasePlugin):
                 pil_img.save(buf, format="JPEG", quality=self.vlm_compress_quality)
                 bs64 = base64.b64encode(buf.getvalue()).decode()
                 image = Image(image=f"data:image/jpeg;base64,{bs64}")
-                logger.info(f"Compressed sticker {filename} → JPEG q={self.vlm_compress_quality} ({buf.tell()/1024:.0f}KB base64)")
+                logger.info(f"Compressed {label} → JPEG q={self.vlm_compress_quality} ({buf.tell()/1024:.0f}KB base64)")
             else:
-                image = Image(image=sticker_path)
+                image = Image(image=filepath)
 
             sticker_desc = await desc_img(
                 client=vlm,
@@ -464,8 +503,14 @@ class QQStickerSyncPlugin(BasePlugin):
             )
             return sticker_desc
         except Exception as e:
-            logger.error(f"VLM description failed for sticker {filename}: {e}")
+            logger.error(f"VLM description failed for {label}: {e}")
             return None
+
+    async def _describe_sticker(self, item: dict) -> Optional[str]:
+        """VLM-describe a new sticker from download result. Delegates to _vlm_describe_file."""
+        filename = item["filename"]
+        sticker_path = os.path.join(STICKER_DIR, filename)
+        return await self._vlm_describe_file(sticker_path, filename)
 
     # ── 删除失效表情 ──────────────────────────────────────────
 
