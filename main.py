@@ -36,7 +36,8 @@ logger = get_logger("qq-sticker-sync", "cyan")
 
 STICKER_DIR = f"{get_data_path()}/sticker"
 QQ_SYNC_PREFIX = "qqsync_"
-STICKER_DESC_PROMPT = (
+# Fallback prompt when default-sticker's prompt cannot be retrieved
+_FALLBACK_PROMPT = (
     "这是一张sticker（表情包），请描述这张表情包的内容和聊天中哪些情景使用此表情包，"
     "要求描述精确，不要太长，不要使用Markdown等标记符号，如果有文字请将其输出"
 )
@@ -471,6 +472,20 @@ class QQStickerSyncPlugin(BasePlugin):
 
     # ── VLM 描述（共享核心，带压缩） ────────────────────────────
 
+    def _get_vlm_prompt(self) -> str:
+        """获取 VLM 提示词。
+        优先引用 default-sticker 的 recognition_prompt（尊重用户自定义），失败则用内置兜底。
+        """
+        try:
+            sticker_plugin = self.ctx.get_plugin_inst("default-sticker")
+            if sticker_plugin and hasattr(sticker_plugin, "recognition_prompt"):
+                prompt = sticker_plugin.recognition_prompt
+                if prompt:
+                    return prompt
+        except Exception:
+            pass
+        return _FALLBACK_PROMPT
+
     async def _vlm_describe_file(self, filepath: str, label: str) -> Optional[str]:
         """VLM-describe an image file. Shared by recovery and new sticker phases."""
         if not os.path.exists(filepath):
@@ -499,7 +514,7 @@ class QQStickerSyncPlugin(BasePlugin):
             sticker_desc = await desc_img(
                 client=vlm,
                 image=image,
-                prompt=STICKER_DESC_PROMPT,
+                prompt=self._get_vlm_prompt(),
             )
             return sticker_desc
         except Exception as e:
