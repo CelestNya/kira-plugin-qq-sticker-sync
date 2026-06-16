@@ -46,7 +46,10 @@ class QQStickerSyncPlugin(BasePlugin):
     async def initialize(self):
         self.interval_sec = max(self.plugin_cfg.get("sync_interval_sec", 1800), 60)
         self.auto_delete = self.plugin_cfg.get("auto_delete", False)
+        self.register_concurrency = max(self.plugin_cfg.get("register_concurrency", 3), 1)
         self.sticker_mgr = self.ctx.sticker_manager
+
+        self._register_sem = asyncio.Semaphore(self.register_concurrency)
 
         os.makedirs(STICKER_DIR, exist_ok=True)
 
@@ -57,7 +60,7 @@ class QQStickerSyncPlugin(BasePlugin):
         )
 
         self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s)")
+        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, register_concurrency={self.register_concurrency})")
 
     async def terminate(self):
         if self._sync_task:
@@ -231,14 +234,38 @@ class QQStickerSyncPlugin(BasePlugin):
         total = len(pending)
         logger.info(f"Need to download {total}/{len(urls)} new stickers")
 
-        new_count = 0
-        for idx, (url, url_hash, meta) in enumerate(pending, 1):
-            e_id = meta.get("e_id", "")
-            label = e_id or url_hash
-            logger.info(f"[{idx}/{total}] Downloading {label}...")
+        # ── Phase 1: 并发下载（无限制） ──
+        download_results: list[Optional[dict]] = [None] * total
 
-            if await self._download_and_register(url, url_hash, meta):
+        async def _download_one(idx: int, url: str, url_hash: str, meta: dict):
+            result = await self._download_content(url, url_hash, meta)
+            download_results[idx] = result
+
+        tasks = [_download_one(i, u, h, m) for i, (u, h, m) in enumerate(pending)]
+        await asyncio.gather(*tasks)
+
+        # ── Phase 2: 限流注册（Semaphore 控制 VLM 并发） ──
+        new_count = 0
+
+        async def _register_one(item: dict) -> bool:
+            async with self._register_sem:
+                return await self._register_content(item)
+
+        reg_tasks = []
+        for item in download_results:
+            if item is None:
+                continue
+            reg_tasks.append(_register_one(item))
+
+        if reg_tasks:
+            reg_results = await asyncio.gather(*reg_tasks)
+            for item, success in zip([d for d in download_results if d], reg_results):
+                if not success:
+                    continue
                 new_count += 1
+                url_hash = item["url_hash"]
+                meta = item["meta"]
+                e_id = meta.get("e_id", "")
                 if meta.get("is_mark_face") and e_id:
                     existing_eids.add(e_id)
                 else:
@@ -286,17 +313,15 @@ class QQStickerSyncPlugin(BasePlugin):
         if removed:
             logger.info(f"Cleaned {removed} stale DB entries (file missing or duplicate)")
 
-    # ── 下载并注册 ────────────────────────────────────────────
+    # ── 下载 ──────────────────────────────────────────────────
 
-    async def _download_and_register(self, url: str, url_hash: str, meta: dict = None) -> bool:
-        """Download a QQ sticker and register it with sticker manager"""
+    async def _download_content(self, url: str, url_hash: str, meta: dict) -> Optional[dict]:
+        """Download sticker image bytes. No side effects, no VLM trigger."""
         if not self._http_client:
-            return False
-        meta = meta or {}
+            return None
         is_mark = meta.get("is_mark_face", False)
         e_id = meta.get("e_id", "")
 
-        # Market faces with e_id: use CDN 300px URL for higher quality
         if is_mark and e_id:
             download_url = self._build_cdn_url(e_id)
         else:
@@ -310,29 +335,56 @@ class QQStickerSyncPlugin(BasePlugin):
                 logger.warning(f"Slow download ({elapsed:.1f}s): {download_url[:60]}...")
             if response.status_code != 200:
                 logger.warning(f"Download failed {download_url[:60]}... (HTTP {response.status_code})")
-                return False
+                return None
 
             content = response.content
             if not content:
-                return False
+                return None
 
-            # Detect extension from Content-Type
             ct = response.headers.get("content-type", "")
             ext = self._content_type_to_ext(ct) or ".png"
-            # For CDN-sourced market faces, use e_id as filename for consistency
+
             if is_mark and e_id:
                 filename = f"qqsync_{e_id}{ext}"
             else:
                 filename = f"qqsync_{url_hash}{ext}"
 
+            label = e_id or url_hash
+            logger.info(f"Downloaded {label} ({len(content)}B, {elapsed:.1f}s)")
+            return {
+                "filename": filename,
+                "content": content,
+                "url_hash": url_hash,
+                "url": url,
+                "meta": meta,
+            }
+
+        except httpx.TimeoutException:
+            logger.warning(f"Timeout downloading {download_url[:60]}...")
+        except Exception as e:
+            logger.error(f"Error downloading {download_url[:60]}...: {e}")
+        return None
+
+    # ── 注册（Semaphore 限流，触发 default-sticker VLM） ────────
+
+    async def _register_content(self, item: dict) -> bool:
+        """Register downloaded content with StickerManager. Gated by _register_sem."""
+        filename = item["filename"]
+        content = item["content"]
+        url_hash = item["url_hash"]
+        url = item["url"]
+        meta = item["meta"]
+        is_mark = meta.get("is_mark_face", False)
+        e_id = meta.get("e_id", "")
+
+        try:
             result = await self.sticker_mgr.add_sticker(
                 file_bytes=content,
                 original_filename=filename,
                 sticker_id=None,
-                desc="",  # let default-sticker VLM describe it
+                desc="",
             )
 
-            # Store metadata in extra for later reference
             extra_fields = {
                 "source": "qq_sticker_sync",
                 "source_url_hash": url_hash,
@@ -347,17 +399,14 @@ class QQStickerSyncPlugin(BasePlugin):
                 self.sticker_mgr.set_sticker_extra(result["id"], key, val)
 
             if is_mark:
-                logger.info(f"Synced QQ marketplace sticker: id={result['id']}, file={filename} ({len(content)}B, 300px)")
+                logger.info(f"Registered QQ marketplace sticker: id={result['id']}, file={filename}")
             else:
-                logger.info(f"Synced QQ sticker: id={result['id']}, file={filename} ({len(content)}B)")
+                logger.info(f"Registered QQ sticker: id={result['id']}, file={filename}")
             return True
 
-        except httpx.TimeoutException:
-            logger.warning(f"Timeout downloading {download_url[:60]}...")
         except Exception as e:
-            logger.error(f"Error downloading {download_url[:60]}...: {e}")
-
-        return False
+            logger.error(f"Failed to register sticker {filename}: {e}")
+            return False
 
     # ── 删除失效表情 ──────────────────────────────────────────
 

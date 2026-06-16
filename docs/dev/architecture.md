@@ -24,8 +24,9 @@ QQStickerSyncPlugin (BasePlugin)
 │   ├─ _do_sync()             → 单次同步入口
 │   └─ _sync_once(client)     → 核心同步实现
 │
-├─ 下载注册
-│   └─ _download_and_register() → 下载单张图片 + 注册到 StickerManager
+├─ 下载与注册（两阶段）
+│   ├─ _download_content()   → 并发下载，asyncio.gather 无限制
+│   └─ _register_content()   → 限流注册，Semaphore 控制 VLM 触发并发
 │
 ├─ 清理
 │   ├─ _cleanup_stale_db()      → 删除文件不存在的 DB 条目
@@ -65,6 +66,25 @@ QQ 表情有两种类型，使用不同的标识去重：
 
 `_syncing` 布尔值防止并发触发。同步循环本身是串行的，但 HTTP API (`trigger_manual_sync`) 可以异步触发另一个同步周期。锁确保在这种情况下不会重复运行。
 
-### 4. 幂等性
+### 4. 注册并发控制
+
+`default-sticker` 的 `on_sticker_registered` 回调会触发 VLM 调用。如果多个 sticker 同时注册，回调会同步并发执行（无锁），导致 N 路 VLM 同时发出。
+
+解决方案：下载和注册分离为两阶段。
+1. **Phase 1** — `_download_content()`：纯下载，asyncio.gather 全并发，不触发 VLM
+2. **Phase 2** — `_register_content()`：限流注册，通过 `self._register_sem` 控制同时触发 VLM 的数量（默认 3）
+
+```python
+# Phase 1: 并发下载
+await asyncio.gather(*[_download_one(...) for ...])
+
+# Phase 2: 限流注册
+async def _register_one(item):
+    async with self._register_sem:
+        return await self._register_content(item)
+await asyncio.gather(*[_register_one(item) for item in download_results])
+```
+
+### 5. 幂等性
 
 每次同步都是"全量对比 → 增量下载"。不会因重复运行而导致数据不一致。本地已有的贴纸不会被重新下载。
