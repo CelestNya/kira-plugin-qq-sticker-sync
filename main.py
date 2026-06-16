@@ -46,9 +46,11 @@ class QQStickerSyncPlugin(BasePlugin):
     async def initialize(self):
         self.interval_sec = max(self.plugin_cfg.get("sync_interval_sec", 1800), 60)
         self.auto_delete = self.plugin_cfg.get("auto_delete", False)
+        self.download_concurrency = max(self.plugin_cfg.get("download_concurrency", 5), 1)
         self.register_concurrency = max(self.plugin_cfg.get("register_concurrency", 3), 1)
         self.sticker_mgr = self.ctx.sticker_manager
 
+        self._download_sem = asyncio.Semaphore(self.download_concurrency)
         self._register_sem = asyncio.Semaphore(self.register_concurrency)
 
         os.makedirs(STICKER_DIR, exist_ok=True)
@@ -60,7 +62,7 @@ class QQStickerSyncPlugin(BasePlugin):
         )
 
         self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, register_concurrency={self.register_concurrency})")
+        logger.info(f"QQ Sticker Sync initialized (interval={self.interval_sec}s, download_concurrency={self.download_concurrency}, register_concurrency={self.register_concurrency})")
 
     async def terminate(self):
         if self._sync_task:
@@ -238,8 +240,9 @@ class QQStickerSyncPlugin(BasePlugin):
         download_results: list[Optional[dict]] = [None] * total
 
         async def _download_one(idx: int, url: str, url_hash: str, meta: dict):
-            result = await self._download_content(url, url_hash, meta)
-            download_results[idx] = result
+            async with self._download_sem:
+                result = await self._download_content(url, url_hash, meta)
+                download_results[idx] = result
 
         tasks = [_download_one(i, u, h, m) for i, (u, h, m) in enumerate(pending)]
         await asyncio.gather(*tasks)

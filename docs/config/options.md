@@ -12,6 +12,16 @@
 
 QQ 收藏表情不常变动，建议保持默认值 1800（30 分钟）以减少 NapCat API 调用次数。
 
+## download_concurrency
+
+- **类型**: `integer`
+- **默认**: `5`
+- **范围**: 1 及以上
+
+下载并发数。控制同时从 QQ CDN 下载贴纸图片的 HTTP 请求数。
+
+下载阶段是纯网络 I/O，CDN 抗并发能力强。默认 5 在大多数网络环境下能充分利用带宽。
+
 ## register_concurrency
 
 - **类型**: `integer`
